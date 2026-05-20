@@ -1,1 +1,1 @@
-# LIT_Meetup_RAG
+# LIT6_Meetup_RAG
