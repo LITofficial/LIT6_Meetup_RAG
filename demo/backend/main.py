@@ -197,7 +197,7 @@ def split_documents_with_langchain(documents: list[Document]) -> list[dict[str, 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=360,
         chunk_overlap=60,
-        separators=["\n\n", "\n", ". ", "다. ", " ", ""],는
+        separators=["\n\n", "\n", ". ", "다. ", " ", ""],
     )
     split_docs = splitter.split_documents(documents)
     counters: dict[str, int] = {}
