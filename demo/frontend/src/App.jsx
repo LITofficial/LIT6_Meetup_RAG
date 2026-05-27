@@ -128,7 +128,7 @@ function App() {
   const [stages, setStages] = useState(defaultStages)
   const [activeStage, setActiveStage] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
-  const [query, setQuery] = useState('신규 고객 환불 정책을 근거와 함께 알려줘')
+  const [query, setQuery] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
   const [answer, setAnswer] = useState('')
   const [sources, setSources] = useState([])

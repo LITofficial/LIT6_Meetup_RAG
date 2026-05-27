@@ -6,6 +6,7 @@ python-multipart==0.0.9
 # 2. RAG 파이프라인 개발 프레임워크
 langchain>=1.0.0
 langchain-google-genai>=4.0.0
+langchain-text-splitters>=1.0.0
 
 # 3. PDF 파일 리더 및 파서
 pypdf==4.1.0
