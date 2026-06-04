@@ -32,9 +32,11 @@ function StageVisualization({ stage }) {
 function ChunkView({ stage }) {
   const chunks = asArray(stage.rawOutput ?? stage.output)
   const sourceItems = asArray(stage.rawInput ?? stage.input)
-  const sourceLabel = sourceItems.length > 1 ? `${sourceItems.length} source fields` : '1 source document'
+  const source = sourceItems[0] ?? {}
+  const sourceTitle = source.filename ?? source.title ?? (sourceItems.length > 1 ? `${sourceItems.length}개 문서` : '원본 문서')
   const shownCount = Math.min(chunks.length, 6)
-  const sourceText = String(sourceItems[0]?.text ?? sourceItems[0] ?? 'PDF에서 추출된 긴 텍스트')
+  const sourceText = String(source.text ?? sourceItems[0] ?? 'PDF에서 추출된 긴 텍스트')
+  const sourceMeta = source.chars ? `전체 ${source.chars.toLocaleString()}자 중 앞부분 표시` : '원본 텍스트 일부'
 
   return (
     <div className="chunk-viz">
@@ -42,8 +44,9 @@ function ChunkView({ stage }) {
         <article className="document-preview">
           <div className="chunk-section-heading">
             <span>input</span>
-            <strong>{sourceLabel}</strong>
+            <strong>{sourceTitle}</strong>
           </div>
+          <small>{sourceMeta}</small>
           <p>{shorten(sourceText, 220)}</p>
           <div className="cut-guide" aria-label="chunk boundaries">
             <i />

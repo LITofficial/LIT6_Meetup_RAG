@@ -204,12 +204,7 @@ def build_langchain_documents(documents: list[dict[str, str]]) -> list[Document]
 # 2단계: 청킹
 # LangChain RecursiveCharacterTextSplitter로 긴 문서를 작은 문단 카드처럼 나눕니다.
 def split_documents_with_langchain(documents: list[Document]) -> list[dict[str, Any]]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=120,
-        separators=["\n\n", "\n", ". ", "다. ", " ", ""],
-    )
-    split_docs = splitter.split_documents(documents)
+    split_docs, chunk_size, chunk_overlap = split_documents_with_adaptive_size(documents)
     counters: dict[str, int] = {}
     chunks = []
 
@@ -224,10 +219,48 @@ def split_documents_with_langchain(documents: list[Document]) -> list[dict[str, 
                 "title": split_doc.metadata["title"],
                 "text": split_doc.page_content,
                 "tokens": tokenize(split_doc.page_content),
+                "chunk_size": chunk_size,
+                "chunk_overlap": chunk_overlap,
             }
         )
 
     return chunks
+
+
+def split_documents_with_adaptive_size(documents: list[Document]) -> tuple[list[Document], int, int]:
+    target_chunks = int(os.getenv("RAG_TARGET_CHUNKS", "180"))
+    max_chunk_size = int(os.getenv("RAG_MAX_CHUNK_SIZE", "2400"))
+    chunk_size = int(os.getenv("RAG_CHUNK_SIZE", "1200"))
+    chunk_overlap = int(os.getenv("RAG_CHUNK_OVERLAP", "150"))
+    separators = ["\n\n", "\n", ". ", "다. ", " ", ""]
+
+    while True:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=min(chunk_overlap, max(0, chunk_size // 3)),
+            separators=separators,
+        )
+        split_docs = splitter.split_documents(documents)
+
+        if len(split_docs) <= target_chunks or chunk_size >= max_chunk_size:
+            logger.info(
+                "chunking.done chunks=%s chunk_size=%s chunk_overlap=%s target_chunks=%s",
+                len(split_docs),
+                chunk_size,
+                min(chunk_overlap, max(0, chunk_size // 3)),
+                target_chunks,
+            )
+            return split_docs, chunk_size, min(chunk_overlap, max(0, chunk_size // 3))
+
+        next_chunk_size = min(max_chunk_size, int(chunk_size * 1.25))
+        logger.info(
+            "chunking.resize chunks=%s target_chunks=%s chunk_size=%s next_chunk_size=%s",
+            len(split_docs),
+            target_chunks,
+            chunk_size,
+            next_chunk_size,
+        )
+        chunk_size = next_chunk_size
 
 
 # 3단계: 임베딩 모델 준비
@@ -237,6 +270,52 @@ def get_embedding_model() -> GoogleGenerativeAIEmbeddings:
         model=os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"),
         google_api_key=require_google_api_key(),
     )
+
+
+def is_resource_exhausted_error(error: Exception) -> bool:
+    detail = str(error)
+    return "RESOURCE_EXHAUSTED" in detail or "429" in detail
+
+
+async def embed_documents_in_batches(
+    embeddings: GoogleGenerativeAIEmbeddings,
+    texts: list[str],
+) -> list[list[float]]:
+    batch_size = int(os.getenv("GEMINI_EMBEDDING_BATCH_SIZE", "24"))
+    max_retries = int(os.getenv("GEMINI_EMBEDDING_MAX_RETRIES", "3"))
+    vectors: list[list[float]] = []
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        batch_number = (start // batch_size) + 1
+        total_batches = math.ceil(len(texts) / batch_size)
+
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info(
+                    "vector_store.embedding_batch_start batch=%s/%s size=%s attempt=%s",
+                    batch_number,
+                    total_batches,
+                    len(batch),
+                    attempt + 1,
+                )
+                vectors.extend(await embeddings.aembed_documents(batch))
+                break
+            except GoogleGenerativeAIError as error:
+                if not is_resource_exhausted_error(error) or attempt >= max_retries:
+                    raise
+
+                wait_seconds = min(20, (2 ** attempt) * 3)
+                logger.warning(
+                    "vector_store.embedding_rate_limited batch=%s/%s wait_seconds=%s error=%s",
+                    batch_number,
+                    total_batches,
+                    wait_seconds,
+                    error,
+                )
+                await asyncio.sleep(wait_seconds)
+
+    return vectors
 
 
 # 3단계: 임베딩/벡터 저장
@@ -265,7 +344,10 @@ async def build_vector_store(
     try:
         embedding_started_at = time.perf_counter()
         logger.info("vector_store.embedding_start chunks=%s", len(chunks))
-        chunk_embeddings = await embeddings.aembed_documents([chunk["text"] for chunk in chunks])
+        chunk_embeddings = await embed_documents_in_batches(
+            embeddings,
+            [chunk["text"] for chunk in chunks],
+        )
         logger.info(
             "vector_store.embedding_done chunks=%s seconds=%.2f",
             len(chunk_embeddings),
@@ -293,6 +375,15 @@ async def build_vector_store(
             time.perf_counter() - upsert_started_at,
         )
     except GoogleGenerativeAIError as error:
+        if is_resource_exhausted_error(error):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Gemini 임베딩 API 사용량 제한에 걸렸습니다. "
+                    "잠시 후 다시 실행하거나 업로드 문서 수 또는 chunk 수를 줄이세요. "
+                    f"details={error}"
+                ),
+            ) from error
         raise HTTPException(
             status_code=502,
             detail=f"Gemini 임베딩 생성에 실패했습니다. GEMINI_EMBEDDING_MODEL 값을 확인하세요. details={error}",
@@ -474,14 +565,29 @@ async def run_pipeline(
         "contexts": [match["text"] for match in matches],
         "prompt_preview": build_prompt(query, matches),
     }
+    chunk_metric = (
+        f"{len(chunks)} chunks"
+        f" · size {chunks[0].get('chunk_size')}"
+        f" · overlap {chunks[0].get('chunk_overlap')}"
+        if chunks
+        else "0 chunks"
+    )
 
     stages = [
         PipelineStage(
             id="chunk",
             title="청킹",
-            input=[document["title"] for document in documents],
+            input=[
+                {
+                    "title": document["title"],
+                    "filename": document["filename"],
+                    "text": document["text"][:1200],
+                    "chars": len(document["text"]),
+                }
+                for document in documents
+            ],
             output=[{"id": chunk["id"], "text": chunk["text"]} for chunk in chunks],
-            metric=f"{len(chunks)} chunks by LangChain",
+            metric=chunk_metric,
         ),
         PipelineStage(
             id="embed",
@@ -700,16 +806,14 @@ async def query_rag(request: QueryRequest) -> QueryResponse:
 # 실제 데모용 엔드포인트: 여러 PDF/텍스트 파일과 질문을 받아 하나의 RAG 인덱스로 실행합니다.
 @app.post("/api/rag/upload-query", response_model=QueryResponse)
 async def query_uploaded_pdf(
-    files: list[UploadFile] | None = File(default=None),
-    file: UploadFile | None = File(default=None),
+    files: list[UploadFile] = File(...),
     query: str = Form(...),
     top_k: int = Form(3),
 ) -> QueryResponse:
-    upload_files = files or ([file] if file else [])
-    if not upload_files:
+    if not files:
         raise HTTPException(status_code=400, detail="업로드할 파일이 필요합니다.")
 
-    documents = [await document_from_upload(upload_file) for upload_file in upload_files]
+    documents = [await document_from_upload(upload_file) for upload_file in files]
     return await run_pipeline(query=query, top_k=top_k, documents=documents)
 
 

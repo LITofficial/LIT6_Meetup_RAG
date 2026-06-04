@@ -440,7 +440,18 @@ async function fetchWithTimeout(url, options) {
 async function getErrorMessage(response) {
   try {
     const data = await response.json()
-    return data.detail || 'RAG 요청에 실패했습니다.'
+    if (typeof data.detail === 'string') return data.detail
+    if (Array.isArray(data.detail)) {
+      return data.detail
+        .map((item) => {
+          if (typeof item === 'string') return item
+          const location = Array.isArray(item.loc) ? item.loc.join('.') : ''
+          return [location, item.msg].filter(Boolean).join(': ')
+        })
+        .join('\n')
+    }
+    if (data.detail) return JSON.stringify(data.detail)
+    return 'RAG 요청에 실패했습니다.'
   } catch {
     return response.text()
   }
