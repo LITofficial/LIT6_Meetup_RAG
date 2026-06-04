@@ -1,37 +1,29 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useState } from 'react'
+import StageFocus from './components/StageFocus'
 import './App.css'
 
 const API_BASE_URL = 'http://localhost:8000'
+const REQUEST_TIMEOUT_MS = 90000
 
 const defaultStages = [
   {
-    id: 'ingest',
-    title: '문서 수집',
-    label: 'Source',
-    summary: 'PDF, 회의록, 정책 문서가 원본 저장소로 들어옵니다.',
-    input: ['sample_policy.pdf', 'meeting_notes.md', 'faq.csv'],
-    output: ['원문 텍스트 추출', '문서 메타데이터 생성', '페이지 단위 색인 준비'],
-    payload: 'PDF 12p',
-    metric: '3 files',
-  },
-  {
     id: 'chunk',
     title: '청킹',
-    label: 'Chunker',
+    label: 'Chunking',
     summary: '긴 문서를 검색 가능한 작은 단락으로 나눕니다.',
     input: ['원문 텍스트', '문서 제목', '페이지 번호'],
     output: ['chunk_001: 환불 규정', 'chunk_002: 배송 예외', 'chunk_003: 보안 정책'],
-    payload: '12 chunks',
+    payload: '청크',
     metric: '420 tokens',
   },
   {
     id: 'embed',
     title: '임베딩',
     label: 'Embedding',
-    summary: '각 청크를 의미 벡터로 변환해 유사도 검색이 가능하게 만듭니다.',
+    summary: '각 chunk를 AI가 비교할 수 있는 숫자표로 바꿉니다.',
     input: ['chunk_001', 'chunk_002', 'chunk_003'],
     output: ['[0.12, -0.31, 0.77, ...]', '[0.08, -0.24, 0.69, ...]'],
-    payload: '1536 dims',
+    payload: '벡터화',
     metric: 'vectorized',
   },
   {
@@ -41,27 +33,27 @@ const defaultStages = [
     summary: '벡터와 원문 위치를 함께 저장합니다.',
     input: ['embedding', 'chunk text', 'metadata'],
     output: ['collection: docs', 'index: cosine', 'metadata filter: team=ops'],
-    payload: 'index',
+    payload: '저장',
     metric: 'cosine',
   },
   {
     id: 'retrieve',
     title: '검색',
     label: 'Retriever',
-    summary: '사용자 질문을 벡터화하고 가장 가까운 근거 청크를 찾습니다.',
+    summary: '질문과 가장 비슷한 chunk를 점수순으로 찾습니다.',
     input: ['질문: 환불은 언제 가능해?', 'query embedding'],
     output: ['score 0.91: 환불 규정', 'score 0.84: 배송 예외', 'score 0.78: 고객 지원'],
-    payload: 'top-k 3',
+    payload: 'Top-K',
     metric: '0.91',
   },
   {
     id: 'augment',
     title: '컨텍스트 조립',
-    label: 'Prompt',
+    label: 'Prompting',
     summary: '검색 결과를 질문과 함께 모델 입력 프롬프트로 묶습니다.',
     input: ['사용자 질문', '검색된 청크 3개', '시스템 지시문'],
     output: ['근거 중심 프롬프트', '출처 목록', '답변 제약 조건'],
-    payload: 'prompt',
+    payload: '프롬프트',
     metric: '2.1k tokens',
   },
   {
@@ -71,76 +63,69 @@ const defaultStages = [
     summary: '모델이 조립된 컨텍스트만 근거로 답변을 생성합니다.',
     input: ['final prompt', 'retrieved context'],
     output: ['답변 초안', '인용 출처', '신뢰도 표시'],
-    payload: 'answer',
+    payload: '답변',
     metric: 'grounded',
   },
 ]
 
 const stageCopy = {
-  ingest: {
-    label: 'Source',
-    summary: 'PDF가 백엔드로 업로드되고 텍스트와 문서 메타데이터로 변환됩니다.',
-    payload: 'PDF',
-  },
   chunk: {
-    label: 'Chunker',
+    label: 'Chunking',
     summary: '추출된 텍스트를 검색 가능한 작은 청크로 나눕니다.',
-    payload: 'chunks',
+    payload: '청크',
   },
   embed: {
     label: 'Embedding',
-    summary: '청크와 질문을 같은 벡터 공간의 숫자 표현으로 바꿉니다.',
-    payload: 'vectors',
+    summary: '각 chunk를 AI가 비교할 수 있는 숫자표로 바꿉니다.',
+    payload: '벡터화',
   },
   store: {
     label: 'Vector DB',
     summary: '청크, 벡터, 파일명을 함께 저장해 검색 가능한 컬렉션을 만듭니다.',
-    payload: 'index',
+    payload: '저장',
   },
   retrieve: {
     label: 'Retriever',
-    summary: '프롬프트와 가장 가까운 문서 청크를 유사도 기준으로 찾습니다.',
-    payload: 'top-k',
+    summary: '질문과 가장 비슷한 chunk를 점수순으로 찾습니다.',
+    payload: 'Top-K',
   },
   augment: {
-    label: 'Prompt',
+    label: 'Prompting',
     summary: '검색된 근거 청크를 사용자 질문과 함께 최종 프롬프트로 조립합니다.',
-    payload: 'prompt',
+    payload: '프롬프트',
   },
   generate: {
     label: 'LLM',
     summary: '조립된 프롬프트와 근거만 사용해 답변을 생성합니다.',
-    payload: 'answer',
+    payload: '답변',
   },
 }
 
 const connections = [
-  'extract',
-  'split',
-  'embed',
-  'upsert',
-  'search',
-  'compose',
-  'generate',
+  '임베딩',
+  '저장',
+  '검색',
+  '조립',
+  '생성',
 ]
 
 function App() {
   const [stages, setStages] = useState(defaultStages)
   const [activeStage, setActiveStage] = useState(0)
-  const [isPlaying, setIsPlaying] = useState(false)
   const [query, setQuery] = useState('')
-  const [selectedFile, setSelectedFile] = useState(null)
+  const [selectedFiles, setSelectedFiles] = useState([])
   const [answer, setAnswer] = useState('')
   const [sources, setSources] = useState([])
   const [modelName, setModelName] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const [showDebug, setShowDebug] = useState(false)
+  const [hasRun, setHasRun] = useState(false)
+  const [isInputOpen, setIsInputOpen] = useState(true)
   const stage = stages[activeStage]
-
-  const progress = useMemo(
-    () => Math.round(((activeStage + 1) / stages.length) * 100),
-    [activeStage],
-  )
+  const isGenerateStage = stage?.id === 'generate'
+  const shouldShowInputForm = isInputOpen || !hasRun || isSubmitting
+  const stepLabel = `${activeStage + 1} / ${stages.length}`
 
   function moveStage(direction) {
     setActiveStage((current) => {
@@ -159,6 +144,8 @@ function App() {
         title: item.title,
         label: copy.label ?? item.id,
         summary: copy.summary ?? item.title,
+        rawInput: item.input,
+        rawOutput: item.output,
         input: toDisplayItems(item.input),
         output: toDisplayItems(item.output),
         payload: copy.payload ?? item.metric,
@@ -171,11 +158,10 @@ function App() {
     event.preventDefault()
     setError('')
     setIsSubmitting(true)
-    setIsPlaying(false)
 
     try {
-      const response = selectedFile
-        ? await submitUploadedPdf(selectedFile, query)
+      const response = selectedFiles.length > 0
+        ? await submitUploadedPdf(selectedFiles, query)
         : await submitPrompt(query)
 
       if (!response.ok) {
@@ -188,23 +174,14 @@ function App() {
       setSources(data.sources ?? [])
       setModelName(data.model ?? '')
       setActiveStage(0)
-      setIsPlaying(true)
+      setHasRun(true)
+      setIsInputOpen(false)
     } catch (requestError) {
       setError(requestError.message)
     } finally {
       setIsSubmitting(false)
     }
   }
-
-  useEffect(() => {
-    if (!isPlaying) return undefined
-
-    const timer = window.setInterval(() => {
-      setActiveStage((current) => (current + 1) % stages.length)
-    }, 1800)
-
-    return () => window.clearInterval(timer)
-  }, [isPlaying])
 
   return (
     <main className="rag-app">
@@ -215,13 +192,11 @@ function App() {
         </div>
         <div className="run-panel" aria-label="pipeline progress">
           <div className="run-actions">
-            <span>{progress}%</span>
-            <button type="button" onClick={() => setIsPlaying((value) => !value)}>
-              {isPlaying ? 'Pause' : 'Play'}
-            </button>
+            <span>{stage.title}</span>
+            <strong>{stepLabel}</strong>
           </div>
           <div className="progress-track">
-            <div style={{ width: `${progress}%` }} />
+            <div style={{ width: `${((activeStage + 1) / stages.length) * 100}%` }} />
           </div>
         </div>
       </header>
@@ -245,36 +220,44 @@ function App() {
         </aside>
 
         <section className="flow-board" aria-label="visual data flow">
-          <form className="rag-form" onSubmit={handleSubmit}>
-            <label className="file-picker">
-              <span>PDF</span>
-              <input
-                type="file"
-                accept="application/pdf,.pdf,.txt,.md"
-                onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
-              />
-              <strong>{selectedFile ? selectedFile.name : '파일 선택'}</strong>
-            </label>
-            <label className="prompt-box">
-              <span>Prompt</span>
-              <textarea
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                rows="3"
-                placeholder="PDF에 대해 묻고 싶은 내용을 입력하세요"
-              />
-            </label>
-            <button type="submit" disabled={isSubmitting || !query.trim()}>
-              {isSubmitting ? 'Running' : 'Run RAG'}
-            </button>
-          </form>
+          {shouldShowInputForm ? (
+            <form className="rag-form" onSubmit={handleSubmit}>
+              <label className="file-picker">
+                <span>PDF</span>
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf,.txt,.md"
+                  multiple
+                  onChange={(event) => setSelectedFiles(Array.from(event.target.files ?? []))}
+                />
+                <strong>{formatSelectedFiles(selectedFiles)}</strong>
+              </label>
+              <label className="prompt-box">
+                <span>Prompt</span>
+                <textarea
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  rows="3"
+                  placeholder="PDF에 대해 묻고 싶은 내용을 입력하세요"
+                />
+              </label>
+              <button type="submit" disabled={isSubmitting || !query.trim()}>
+                {isSubmitting ? 'Running' : 'Run RAG'}
+              </button>
+            </form>
+          ) : (
+            <section className="run-summary">
+              <div>
+                <span>Current Run</span>
+                <strong>{formatSelectedFiles(selectedFiles, '샘플 문서')} · “{query}”</strong>
+              </div>
+              <button type="button" onClick={() => setIsInputOpen(true)}>
+                Edit input
+              </button>
+            </section>
+          )}
 
           {error && <p className="error-message">{error}</p>}
-
-          <div className="query-strip">
-            <span className="query-label">User Query</span>
-            <strong>“{query}”</strong>
-          </div>
 
           <div className="pipeline-map">
             {stages.map((item, index) => (
@@ -285,8 +268,8 @@ function App() {
                   onClick={() => setActiveStage(index)}
                   aria-label={item.title}
                 >
-                  <span>{item.label}</span>
-                  <strong>{item.payload}</strong>
+                  <span>{item.title}</span>
+                  <strong>{item.label}</strong>
                 </button>
                 {index < stages.length - 1 && (
                   <div className={index < activeStage ? 'connector filled' : 'connector'}>
@@ -302,50 +285,18 @@ function App() {
               className="data-packet"
               style={{ left: `calc(${(activeStage / (stages.length - 1)) * 100}% - 42px)` }}
             >
-              {stage.payload}
+              {stage.title}
             </div>
           </div>
 
           <div className="detail-grid">
-            <section className="detail-panel">
-              <div className="panel-heading">
-                <span>Input</span>
-                <strong>{stage.title}</strong>
-              </div>
-              <ul>
-                {stage.input.map((item, index) => (
-                  <li key={`${stage.id}-input-${index}`}>{item}</li>
-                ))}
-              </ul>
-            </section>
-
-            <section className="stage-focus">
-              <span className="stage-number">{String(activeStage + 1).padStart(2, '0')}</span>
-              <h2>{stage.title}</h2>
-              <p>{stage.summary}</p>
-              <div className="metric-row">
-                <span>{stage.metric}</span>
-                <span>{stage.label}</span>
-              </div>
-            </section>
-
-            <section className="detail-panel">
-              <div className="panel-heading">
-                <span>Output</span>
-                <strong>다음 단계로 이동</strong>
-              </div>
-              <ul>
-                {stage.output.map((item, index) => (
-                  <li key={`${stage.id}-output-${index}`}>{item}</li>
-                ))}
-              </ul>
-            </section>
+            <StageFocus stage={stage} activeStage={activeStage} />
           </div>
 
-          {(answer || sources.length > 0) && (
+          {isGenerateStage && (answer || sources.length > 0) && (
             <section className="result-panel">
               <div>
-                <span>Answer {modelName ? `· ${modelName}` : ''}</span>
+                <span>Final Answer {modelName ? `· ${modelName}` : ''}</span>
                 <p>{answer}</p>
               </div>
               <div>
@@ -361,6 +312,40 @@ function App() {
               </div>
             </section>
           )}
+
+          <section className="debug-panel">
+            <button type="button" onClick={() => setShowDebug((value) => !value)}>
+              <span>{showDebug ? 'Hide' : 'Show'} Debug Details</span>
+              <strong>Raw input / output</strong>
+            </button>
+            {showDebug && (
+              <div className="debug-grid">
+                <section className="detail-panel">
+                  <div className="panel-heading">
+                    <span>Raw Input</span>
+                    <strong>{stage.title}에 들어간 값</strong>
+                  </div>
+                  <ul>
+                    {stage.input.map((item, index) => (
+                      <li key={`${stage.id}-input-${index}`}>{item}</li>
+                    ))}
+                  </ul>
+                </section>
+
+                <section className="detail-panel">
+                  <div className="panel-heading">
+                    <span>Raw Output</span>
+                    <strong>전체 데이터 · 스크롤</strong>
+                  </div>
+                  <ul>
+                    {stage.output.map((item, index) => (
+                      <li key={`${stage.id}-output-${index}`}>{item}</li>
+                    ))}
+                  </ul>
+                </section>
+              </div>
+            )}
+          </section>
 
           <div className="controls">
             <button type="button" onClick={() => moveStage(-1)} aria-label="previous stage">
@@ -408,23 +393,48 @@ function toDisplayItems(value) {
 }
 
 function submitPrompt(query) {
-  return fetch(`${API_BASE_URL}/api/rag/query`, {
+  return fetchWithTimeout(`${API_BASE_URL}/api/rag/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, top_k: 3 }),
   })
 }
 
-function submitUploadedPdf(file, query) {
+function submitUploadedPdf(files, query) {
   const formData = new FormData()
-  formData.append('file', file)
+  files.forEach((file) => formData.append('files', file))
   formData.append('query', query)
   formData.append('top_k', '3')
 
-  return fetch(`${API_BASE_URL}/api/rag/upload-query`, {
+  return fetchWithTimeout(`${API_BASE_URL}/api/rag/upload-query`, {
     method: 'POST',
     body: formData,
   })
+}
+
+function formatSelectedFiles(files, emptyLabel = '파일 선택') {
+  if (!files.length) return emptyLabel
+  if (files.length === 1) return files[0].name
+  return `${files[0].name} 외 ${files.length - 1}개`
+}
+
+async function fetchWithTimeout(url, options) {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    })
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('RAG 요청이 90초 안에 끝나지 않았습니다. PDF 추출, 임베딩, Gemini 응답 중 지연된 단계가 있는지 백엔드 로그를 확인하세요.')
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timer)
+  }
 }
 
 async function getErrorMessage(response) {
