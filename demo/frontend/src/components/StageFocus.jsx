@@ -33,7 +33,7 @@ function ChunkView({ stage }) {
   const chunks = asArray(stage.rawOutput ?? stage.output)
   const sourceItems = asArray(stage.rawInput ?? stage.input)
   const source = sourceItems[0] ?? {}
-  const sourceTitle = source.filename ?? source.title ?? (sourceItems.length > 1 ? `${sourceItems.length}개 문서` : '원본 문서')
+  const sourceTitle = sourceItems.length > 1 ? `${sourceItems.length}개 문서` : source.filename ?? source.title ?? '원본 문서'
   const shownCount = Math.min(chunks.length, 6)
   const sourceText = String(source.text ?? sourceItems[0] ?? 'PDF에서 추출된 긴 텍스트')
   const sourceMeta = source.chars ? `전체 ${source.chars.toLocaleString()}자 중 앞부분 표시` : '원본 텍스트 일부'
@@ -84,68 +84,181 @@ function ChunkView({ stage }) {
 
 function EmbeddingView({ vectors }) {
   const normalizedVectors = normalizeVectors(vectors)
+  const plotItems = normalizedVectors
+    .map((vector, index) => {
+      const point = vector.point3d ?? vectorPoint3d(vector, index)
+      const projected = projectPlotPoint(point)
+      return {
+        id: vector.id ?? `chunk_${index + 1}`,
+        label: compactId(vector.id ?? `chunk_${index + 1}`),
+        cluster: clusterIndex(point, index),
+        index,
+        point,
+        projected,
+      }
+    })
+    .sort((left, right) => left.point.z - right.point.z)
+  const gridLines = buildPlotGrid()
 
   return (
     <div className="embedding-visual">
-      <div className="embedding-space" aria-label="semantic space preview">
-        {normalizedVectors.map((vector, index) => {
-          const x = vector.mapX ?? clamp(50 + Number(vector.embedding_preview[0]) * 620, 9, 91)
-          const y = vector.mapY ?? clamp(50 - Number(vector.embedding_preview[1]) * 620, 14, 86)
-          return (
-            <span
-              className="semantic-point"
-              key={`point-${vector.id ?? index}`}
-            >
-              <i
-                className="chunk-point embedding-point"
-                style={{ left: `${x}%`, top: `${y}%` }}
-                data-label={compactId(vector.id ?? `chunk_${index + 1}`)}
+      <div className="embedding-space plot-space" aria-label="PCA 3D embedding plot">
+        <svg className="embedding-plot" viewBox="0 0 1200 680" role="img" aria-label="PCA 3D embedding plot">
+          <g className="plot-walls">
+            {gridLines.map((line) => (
+              <line
+                key={line.id}
+                className={line.kind}
+                x1={line.start.x}
+                y1={line.start.y}
+                x2={line.end.x}
+                y2={line.end.y}
               />
-            </span>
-          )
-        })}
+            ))}
+          </g>
+          <g className="plot-points">
+            {plotItems.map((item) => (
+              <g className={`plot-point cluster-${item.cluster}`} key={`plot-${item.id}`}>
+                <circle
+                  className="plot-point-halo"
+                  cx={item.projected.x}
+                  cy={item.projected.y}
+                  r={10 + item.projected.depth * 6}
+                />
+                <circle
+                  className="plot-point-core"
+                  cx={item.projected.x}
+                  cy={item.projected.y}
+                  r={4.5 + item.projected.depth * 3.5}
+                />
+              </g>
+            ))}
+          </g>
+        </svg>
       </div>
     </div>
   )
+}
+
+function buildPlotGrid() {
+  const lines = []
+  const values = [-36, -24, -12, 0, 12, 24, 36]
+
+  values.forEach((value) => {
+    lines.push(plotLine(`floor-x-${value}`, { x: -36, y: -36, z: value }, { x: 36, y: -36, z: value }, 'floor-line'))
+    lines.push(plotLine(`floor-z-${value}`, { x: value, y: -36, z: -36 }, { x: value, y: -36, z: 36 }, 'floor-line'))
+    lines.push(plotLine(`wall-y-left-${value}`, { x: -36, y: -36, z: value }, { x: -36, y: 36, z: value }, 'wall-line'))
+    lines.push(plotLine(`wall-x-back-${value}`, { x: value, y: -36, z: 36 }, { x: value, y: 36, z: 36 }, 'wall-line'))
+    lines.push(plotLine(`wall-y-back-${value}`, { x: value, y: -36, z: 36 }, { x: value, y: 36, z: 36 }, 'wall-line'))
+  })
+
+  return lines
+}
+
+function plotLine(id, startPoint, endPoint, kind) {
+  return {
+    id,
+    kind,
+    start: projectPlotPoint(startPoint),
+    end: projectPlotPoint(endPoint),
+  }
 }
 
 function RetrieveView({ stage }) {
   const retrieval = normalizeRetrieval(stage.rawOutput ?? stage.output)
   const candidates = retrieval.candidates
   const selectedMatches = retrieval.topK
-  const maxScore = Math.max(...candidates.map((match) => Number(match.score) || 0), 1)
   const query = typeof stage.rawInput === 'object' ? stage.rawInput.query : 'user query'
   const topK = typeof stage.rawInput === 'object' ? stage.rawInput.top_k : selectedMatches.length
+  const topMatchIds = new Set(selectedMatches.map((match) => match.chunk_id))
+  const queryPoint = stage.rawInput?.query_point3d ?? retrieval.queryPoint3d ?? { x: 0, y: 0, z: 0 }
+  const queryProjection = projectPlotPoint(queryPoint)
+  const plotItems = candidates
+    .slice(0, 8)
+    .map((match, index) => {
+      const point = match.point3d ?? rankedPoint3d(index)
+      return {
+        ...match,
+        point,
+        projected: projectPlotPoint(point),
+        cluster: clusterIndex(point, index),
+        isTopMatch: topMatchIds.has(match.chunk_id),
+      }
+    })
+    .sort((left, right) => left.point.z - right.point.z)
+  const topLinks = selectedMatches
+    .slice(0, topK)
+    .map((match, index) => {
+      const point = match.point3d ?? candidates.find((candidate) => candidate.chunk_id === match.chunk_id)?.point3d
+      if (!point) return null
+      return {
+        id: match.chunk_id ?? `match_${index + 1}`,
+        target: projectPlotPoint(point),
+      }
+    })
+    .filter(Boolean)
+  const gridLines = buildPlotGrid()
+  const maxScore = Math.max(...candidates.map((match) => Number(match.score) || 0), 1)
 
   return (
     <div className="retrieve-viz">
-      <div className="retrieve-map">
+      <div className="retrieve-map plot-space">
         <div className="map-explainer">
-          <span>질문 위치</span>
-          <strong>Q와 각 chunk의 방향이 얼마나 비슷한지 비교합니다</strong>
+          <span>query embedding</span>
+          <strong>질문 벡터와 가까운 chunk를 찾아 연결합니다</strong>
         </div>
-        <span className="query-point" style={{ left: '50%', top: '50%' }}>Q</span>
-        {candidates.slice(0, 5).map((match, index) => {
-          const point = rankedPoint(index)
-          const dx = point.x - 50
-          const dy = point.y - 50
-          return (
-            <span className="semantic-point featured" key={`retrieve-map-${match.chunk_id ?? index}`}>
-              <i
-                className="semantic-line"
-                style={{
-                  left: '50%',
-                  top: '50%',
-                  width: `${Math.sqrt(dx * dx + dy * dy)}%`,
-                  transform: `rotate(${Math.atan2(dy, dx)}rad)`,
-                }}
+        <svg className="retrieve-plot" viewBox="0 0 1200 680" role="img" aria-label="query vector and retrieved chunks">
+          <g className="plot-walls">
+            {gridLines.map((line) => (
+              <line
+                key={`retrieve-${line.id}`}
+                className={line.kind}
+                x1={line.start.x}
+                y1={line.start.y}
+                x2={line.end.x}
+                y2={line.end.y}
               />
-              <i className="chunk-point" style={{ left: `${point.x}%`, top: `${point.y}%` }}>
-                {index + 1}
-              </i>
-            </span>
-          )
-        })}
+            ))}
+          </g>
+          <g className="query-links">
+            {topLinks.map((link) => (
+              <line
+                key={`query-link-${link.id}`}
+                className="query-link"
+                x1={queryProjection.x}
+                y1={queryProjection.y}
+                x2={link.target.x}
+                y2={link.target.y}
+              />
+            ))}
+          </g>
+          <g className="plot-points">
+            {plotItems.map((item) => (
+              <g
+                className={`candidate-point cluster-${item.cluster}${item.isTopMatch ? ' top-match' : ''}`}
+                key={`retrieve-point-${item.chunk_id ?? item.id}`}
+              >
+                <circle
+                  className="plot-point-halo"
+                  cx={item.projected.x}
+                  cy={item.projected.y}
+                  r={9 + item.projected.depth * 6}
+                />
+                <circle
+                  className="plot-point-core"
+                  cx={item.projected.x}
+                  cy={item.projected.y}
+                  r={4 + item.projected.depth * 3.5}
+                />
+              </g>
+            ))}
+            <g className="query-vector">
+              <circle className="query-vector-halo" cx={queryProjection.x} cy={queryProjection.y} r="24" />
+              <circle className="query-vector-core" cx={queryProjection.x} cy={queryProjection.y} r="12" />
+              <text className="query-vector-label" x={queryProjection.x + 20} y={queryProjection.y - 16}>Query</text>
+            </g>
+          </g>
+        </svg>
         <strong>{shorten(query, 72)}</strong>
       </div>
 
@@ -330,8 +443,7 @@ function normalizeVectors(vectors) {
         ...vector,
         label: compactId(vector.id),
         topic: inferTopic(vector.text ?? vector.id ?? '', index),
-        mapX: fallback.x,
-        mapY: fallback.y,
+        point3d: vector.point3d ?? vectorPoint3d(vector, index),
       }
     }
 
@@ -342,8 +454,7 @@ function normalizeVectors(vectors) {
       topic: inferTopic(text, index) || topics[index % topics.length],
       text,
       embedding_preview: samples[index % samples.length],
-      mapX: fallback.x,
-      mapY: fallback.y,
+      point3d: vectorPoint3d({ embedding_preview: samples[index % samples.length] }, index),
     }
   })
 }
@@ -357,15 +468,53 @@ function fallbackPoint(index) {
   }
 }
 
-function rankedPoint(index) {
+function rankedPoint3d(index) {
   const points = [
-    { x: 58, y: 42 },
-    { x: 37, y: 58 },
-    { x: 65, y: 63 },
-    { x: 27, y: 35 },
-    { x: 78, y: 31 },
+    { x: 11, y: 9, z: 13 },
+    { x: -15, y: -7, z: 8 },
+    { x: 22, y: -18, z: -3 },
+    { x: -28, y: 18, z: -10 },
+    { x: 34, y: 22, z: 4 },
   ]
   return points[index % points.length]
+}
+
+function vectorPoint3d(vector, index) {
+  const preview = vector.embedding_preview ?? []
+  const fallback = fallbackPoint(index)
+  return {
+    x: clamp(Number(preview[0]) * 54 || fallback.x - 50, -42, 42),
+    y: clamp(Number(preview[1]) * -54 || 50 - fallback.y, -34, 34),
+    z: clamp(Number(preview[2]) * 46 || ((index % 7) - 3) * 7, -32, 32),
+  }
+}
+
+function projectPoint(point) {
+  const x = 50 + point.x * 0.78 + point.z * 0.32
+  const y = 54 - point.y * 0.68 + point.z * 0.24
+  const depth = clamp((point.z + 36) / 72, 0, 1)
+  return {
+    x: clamp(x, 8, 92),
+    y: clamp(y, 10, 90),
+    scale: (0.9 + depth * 0.46).toFixed(3),
+    opacity: (0.64 + depth * 0.36).toFixed(3),
+  }
+}
+
+function projectPlotPoint(point) {
+  const depth = clamp((point.z + 42) / 84, 0, 1)
+  return {
+    x: 600 + point.x * 6.8 + point.z * 4.2,
+    y: 388 - point.y * 4.8 - point.z * 2.7,
+    depth,
+  }
+}
+
+function clusterIndex(point, index) {
+  if (point.x > 8 && point.y > 0) return 1
+  if (point.x < -8 && point.y > 0) return 2
+  if (point.z > 8) return 3
+  return index % 4
 }
 
 function compactId(value) {
@@ -408,11 +557,12 @@ function normalizeRetrieval(value) {
     return {
       candidates: candidates.length ? candidates : topK,
       topK: topK.length ? topK : candidates,
+      queryPoint3d: value.query_point3d ?? value.queryPoint3d,
     }
   }
 
   const matches = normalizeMatches(value)
-  return { candidates: matches, topK: matches }
+  return { candidates: matches, topK: matches, queryPoint3d: { x: 0, y: 0, z: 0 } }
 }
 
 function normalizeStoreRecords(value) {

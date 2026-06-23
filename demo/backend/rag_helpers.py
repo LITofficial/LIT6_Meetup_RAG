@@ -104,6 +104,7 @@ def split_documents_adaptively(
             chunk_overlap=min(chunk_overlap, max(0, chunk_size // 3)),
             separators=separators,
         )
+        # 실제 chinking method
         split_docs = splitter.split_documents(documents)
 
         if len(split_docs) <= target_chunks or chunk_size >= max_chunk_size:
@@ -388,7 +389,7 @@ def build_context(matches: list[dict[str, Any]]) -> str:
 
 def prompt_context_payload(query: str, matches: list[dict[str, Any]], context: str, prompt_preview: str) -> dict[str, Any]:
     return {
-        "system": "LangChain ChatPromptTemplate: 검색된 근거만 사용해 답변하고 출처를 포함합니다.",
+        "system": "LangChain ChatPromptTemplate: 검색된 근거만 사용하고, 근거가 부족하면 모른다고 답합니다.",
         "query": query,
         "contexts": [match["text"] for match in matches],
         "context": context,
@@ -483,10 +484,14 @@ def clean_answer(answer: str) -> str:
     return cleaned.strip()
 
 
+def unknown_answer() -> str:
+    return "문서에서 관련 근거를 찾지 못했습니다."
+
+
 def compose_fallback_answer(query: str, matches: list[dict[str, Any]]) -> str:
     primary = matches[0] if matches else None
     if not primary:
-        return "관련 문서 근거를 찾지 못했습니다."
+        return unknown_answer()
 
     evidence = " ".join(match["text"] for match in matches)
     if "환불" in query:

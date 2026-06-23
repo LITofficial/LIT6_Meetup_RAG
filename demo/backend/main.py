@@ -1,29 +1,40 @@
+import hashlib
 import os
+import unicodedata
+from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import rag_helpers as helpers
-from rag_config import ANSWER_CACHE, RAG_PROMPT, SAMPLE_DOCUMENTS, VECTOR_STORE_CACHE, logger
-from response_builders import build_query_response
+from rag_config import ANSWER_CACHE, RAG_PROMPT, VECTOR_STORE_CACHE, logger
+from response_builders import build_chunk_stage, build_query_response
 from schemas import QueryResponse
 from server import create_app
 
 
+DEMO_DOCUMENT_CACHE: list[dict[str, str]] | None = None
+DEMO_CHUNKS_CACHE: list[dict[str, Any]] | None = None
+
+
 # 전체 RAG 파이프라인
 # 준비된 텍스트 문서 -> 청킹 -> 임베딩 -> 벡터 저장 -> 검색 -> 프롬프트 조립 -> Gemini 답변까지 순서대로 실행합니다.
-async def run_pipeline(query: str, top_k: int = 3, documents: list[dict[str, str]] | None = None, use_gemini: bool = True) -> QueryResponse:
-    documents = documents or SAMPLE_DOCUMENTS
+async def run_pipeline(query: str, top_k: int = 3, documents: list[dict[str, str]] | None = None, use_gemini: bool | None = None) -> QueryResponse:
+    uses_demo_document = documents is None
+    documents = documents or load_demo_documents()
+    use_gemini = resolve_gemini_mode(use_gemini)
     logger.info("pipeline.start documents=%s query_chars=%s use_gemini=%s", len(documents), len(query), use_gemini)
 
-    chunks = chunk_documents(documents)
+    chunks = load_demo_chunks(documents) if uses_demo_document else chunk_documents(documents)
     embedding_model = prepare_embedding_model(use_gemini)
     chunk_embeddings = await embed_chunks(documents, chunks, embedding_model, use_gemini)
     vector_store = store_vectors(documents, chunks, chunk_embeddings, embedding_model, use_gemini)
     retrieval_candidates, matches = await retrieve_relevant_chunks(query, top_k, vector_store, use_gemini)
+    matches = relevant_matches(query, matches)
     prompt_context = assemble_prompt_context(query, matches)
     answer, model_name = await generate_grounded_answer(query, matches, prompt_context, use_gemini)
 
@@ -32,6 +43,101 @@ async def run_pipeline(query: str, top_k: int = 3, documents: list[dict[str, str
     )
     logger.info("pipeline.done stages=%s", len(response.stages))
     return response
+
+
+async def preload_demo_document() -> dict[str, Any]:
+    documents = load_demo_documents()
+    chunks = load_demo_chunks(documents)
+    return {"stages": [build_chunk_stage(documents, chunks)]}
+
+
+def resolve_gemini_mode(use_gemini: bool | None) -> bool:
+    if use_gemini is not None:
+        return use_gemini
+    return bool((os.getenv("GOOGLE_API_KEY") or "").strip().strip('"').strip("'"))
+
+
+def load_demo_documents() -> list[dict[str, str]]:
+    global DEMO_DOCUMENT_CACHE
+    if DEMO_DOCUMENT_CACHE is not None:
+        return DEMO_DOCUMENT_CACHE
+
+    DEMO_DOCUMENT_CACHE = []
+    for document_path in resolve_demo_document_paths():
+        document_id = demo_document_id(document_path)
+        text_override = demo_text_override(document_path)
+        if text_override is None:
+            contents = document_path.read_bytes()
+            text = helpers.extract_text_from_file(contents, document_path.name, "application/pdf", document_id, None)
+        else:
+            text = text_override.read_text(encoding="utf-8")
+            logger.info("demo_document.text_override filename=%s override=%s", document_path.name, text_override.name)
+        text = helpers.normalize_extracted_text(text)
+        DEMO_DOCUMENT_CACHE.append(
+            {
+                "id": document_id,
+                "filename": document_path.name,
+                "title": document_path.stem,
+                "text": text,
+            }
+        )
+        logger.info("demo_document.loaded filename=%s chars=%s", document_path.name, len(text))
+
+    return DEMO_DOCUMENT_CACHE
+
+
+def load_demo_chunks(documents: list[dict[str, str]]) -> list[dict[str, Any]]:
+    global DEMO_CHUNKS_CACHE
+    if DEMO_CHUNKS_CACHE is None:
+        DEMO_CHUNKS_CACHE = chunk_documents(documents)
+        logger.info("demo_document.chunked chunks=%s", len(DEMO_CHUNKS_CACHE))
+    return DEMO_CHUNKS_CACHE
+
+
+def resolve_demo_document_paths() -> list[Path]:
+    configured_path = (os.getenv("DEMO_DOCUMENT_PATH") or "").strip()
+    if configured_path:
+        path = Path(configured_path)
+        if path.exists():
+            return [path]
+        raise HTTPException(status_code=500, detail=f"데모 문서를 찾을 수 없습니다: {configured_path}")
+
+    document_dirs = [
+        Path(os.getenv("DEMO_DOCUMENT_DIR", "/app/document")),
+        Path(__file__).resolve().parent.parent / "document",
+    ]
+
+    for document_dir in document_dirs:
+        if not document_dir.exists():
+            continue
+        paths = sorted(document_dir.glob("*.pdf"), key=lambda path: normalize_document_name(path.name))
+        if paths:
+            return paths
+
+    raise HTTPException(status_code=500, detail="document 폴더에서 데모 PDF를 찾지 못했습니다.")
+
+
+def normalize_document_name(name: str) -> str:
+    return unicodedata.normalize("NFKC", name).replace(" ", "").replace("_", "")
+
+
+def demo_document_id(path: Path) -> str:
+    normalized_name = normalize_document_name(path.stem)
+    if "경북대학교" in normalized_name and "학칙" in normalized_name:
+        return "demo_kyungpook_rules"
+    if "컴퓨터학부" in normalized_name and "졸업요건" in normalized_name:
+        return "demo_computer_graduation_requirements"
+    digest = hashlib.sha1(normalized_name.encode("utf-8")).hexdigest()[:10]
+    return f"demo_{digest}"
+
+
+def demo_text_override(path: Path) -> Path | None:
+    normalized_name = normalize_document_name(path.stem)
+    if "컴퓨터학부" in normalized_name and "졸업요건" in normalized_name:
+        markdown_path = path.with_name("졸업요건.md")
+        if markdown_path.exists():
+            return markdown_path
+    return None
 
 
 # 1단계: 청킹
@@ -46,7 +152,6 @@ def chunk_documents(documents: list[dict[str, str]]) -> list[dict[str, Any]]:
     )
     split_docs, chunk_size, chunk_overlap = helpers.split_documents_adaptively(splitter, langchain_documents)
     return helpers.chunk_payloads(split_docs, chunk_size, chunk_overlap)
-
 
 # 2단계 준비: 임베딩 모델 준비
 # Gemini Embeddings를 한 번 준비해 문서 임베딩과 Chroma 검색에 같이 사용합니다.
@@ -87,6 +192,7 @@ def store_vectors(
     if chunk_embeddings is None:
         raise ValueError("저장할 임베딩 벡터가 없습니다.")
     collection_name = helpers.build_collection_name(chunks)
+    # chromadb 객체
     chroma = Chroma(collection_name=collection_name, embedding_function=embedding_model, collection_metadata={"hnsw:space": "cosine"})
     helpers.upsert_chunks_to_chroma(chroma, chunks, chunk_embeddings, collection_name)
     vector_store = helpers.vector_store_payload(chunks, chunk_embeddings, chroma, collection_name)
@@ -101,16 +207,65 @@ async def retrieve_relevant_chunks(
     vector_store: dict[str, Any],
     use_gemini: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    candidate_k = min(len(vector_store["items"]), max(top_k * 3, 5))
+    candidate_k = len(vector_store["items"]) if not use_gemini else min(len(vector_store["items"]), max(top_k * 8, 20))
 
     if use_gemini and vector_store.get("chroma"):
         results = await vector_store["chroma"].asimilarity_search_with_score(query, k=candidate_k)
-        candidates = helpers.format_chroma_results(results)
+        candidates = prioritize_keyword_matches(query, helpers.format_chroma_results(results))
         return candidates, candidates[:top_k]
 
     query_embedding = await helpers.embed_query_for_local_search(query, use_gemini)
-    candidates = helpers.rank_chunks_by_cosine_similarity(query_embedding, vector_store["items"], candidate_k)
+    candidates = prioritize_keyword_matches(query, helpers.rank_chunks_by_cosine_similarity(query_embedding, vector_store["items"], candidate_k))
     return candidates, candidates[:top_k]
+
+
+def prioritize_keyword_matches(query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    query_tokens = set(helpers.tokenize(query))
+    if not query_tokens:
+        return candidates
+
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            keyword_overlap_count(query_tokens, candidate),
+            float(candidate.get("score") or 0),
+        ),
+        reverse=True,
+    )
+
+
+def keyword_overlap_count(query_tokens: set[str], candidate: dict[str, Any]) -> int:
+    evidence_tokens = set(helpers.tokenize(f"{candidate.get('title', '')} {candidate.get('text', '')}"))
+    return len(query_tokens & evidence_tokens)
+
+
+def relevant_matches(query: str, matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    min_score = relevance_threshold()
+    score_filtered = [match for match in matches if float(match.get("score") or 0) >= min_score]
+    if not score_filtered:
+        return []
+
+    query_tokens = set(helpers.tokenize(query))
+    if not query_tokens:
+        return score_filtered
+
+    evidence_tokens = set()
+    for match in score_filtered:
+        evidence_tokens.update(helpers.tokenize(f"{match.get('title', '')} {match.get('text', '')}"))
+
+    if query_tokens & evidence_tokens:
+        return score_filtered
+
+    logger.info("retrieval.rejected_no_keyword_overlap query_tokens=%s", sorted(query_tokens))
+    return []
+
+
+def relevance_threshold() -> float:
+    try:
+        return float(os.getenv("RAG_MIN_RELEVANCE_SCORE", "0.18"))
+    except ValueError:
+        logger.warning("invalid RAG_MIN_RELEVANCE_SCORE; using default 0.18")
+        return 0.18
 
 
 # 5단계: 컨텍스트/프롬프트 조립
@@ -129,6 +284,9 @@ async def generate_grounded_answer(
     prompt_context: dict[str, Any],
     use_gemini: bool,
 ) -> tuple[str, str]:
+    if not matches:
+        return helpers.unknown_answer(), "no-relevant-evidence"
+
     if not use_gemini:
         return helpers.compose_fallback_answer(query, matches), "local-demo"
 
@@ -143,4 +301,4 @@ async def generate_grounded_answer(
     return helpers.cache_answer(query, matches, model_name, helpers.clean_answer(str(response.content)), ANSWER_CACHE)
 
 
-app = create_app(run_pipeline=run_pipeline, document_from_upload=helpers.document_from_upload)
+app = create_app(run_pipeline=run_pipeline, document_from_upload=helpers.document_from_upload, preload_demo_document=preload_demo_document)

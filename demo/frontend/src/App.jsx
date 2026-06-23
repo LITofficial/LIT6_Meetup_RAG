@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import StageFocus from './components/StageFocus'
 import './App.css'
 
 const API_BASE_URL = 'http://localhost:8000'
 const REQUEST_TIMEOUT_MS = 90000
+const DEMO_DOCUMENT_LABEL = '경북대학교 학칙.pdf + 컴퓨터학부 졸업요건.pdf'
 
 const defaultStages = [
   {
@@ -113,11 +114,11 @@ function App() {
   const [stages, setStages] = useState(defaultStages)
   const [activeStage, setActiveStage] = useState(0)
   const [query, setQuery] = useState('')
-  const [selectedFiles, setSelectedFiles] = useState([])
   const [answer, setAnswer] = useState('')
   const [sources, setSources] = useState([])
   const [modelName, setModelName] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isPreloading, setIsPreloading] = useState(true)
   const [error, setError] = useState('')
   const [showDebug, setShowDebug] = useState(false)
   const [hasRun, setHasRun] = useState(false)
@@ -126,6 +127,41 @@ function App() {
   const isGenerateStage = stage?.id === 'generate'
   const shouldShowInputForm = isInputOpen || !hasRun || isSubmitting
   const stepLabel = `${activeStage + 1} / ${stages.length}`
+
+  useEffect(() => {
+    let ignore = false
+
+    async function preloadDemoDocument() {
+      try {
+        const response = await fetchWithTimeout(`${API_BASE_URL}/api/rag/preload`, {
+          method: 'GET',
+        })
+
+        if (!response.ok) {
+          throw new Error(await getErrorMessage(response))
+        }
+
+        const data = await response.json()
+        if (ignore) return
+
+        const preloadedStages = normalizeStages(data.stages ?? [])
+        if (preloadedStages.length > 0) {
+          setStages([preloadedStages[0], ...defaultStages.slice(1)])
+          setActiveStage(0)
+        }
+      } catch (preloadError) {
+        if (!ignore) setError(preloadError.message)
+      } finally {
+        if (!ignore) setIsPreloading(false)
+      }
+    }
+
+    preloadDemoDocument()
+
+    return () => {
+      ignore = true
+    }
+  }, [])
 
   function moveStage(direction) {
     setActiveStage((current) => {
@@ -160,9 +196,7 @@ function App() {
     setIsSubmitting(true)
 
     try {
-      const response = selectedFiles.length > 0
-        ? await submitUploadedPdf(selectedFiles, query)
-        : await submitPrompt(query)
+      const response = await submitPrompt(query)
 
       if (!response.ok) {
         throw new Error(await getErrorMessage(response))
@@ -173,7 +207,7 @@ function App() {
       setAnswer(data.answer)
       setSources(data.sources ?? [])
       setModelName(data.model ?? '')
-      setActiveStage(0)
+      setActiveStage(data.stages?.length > 1 ? 1 : 0)
       setHasRun(true)
       setIsInputOpen(false)
     } catch (requestError) {
@@ -222,16 +256,10 @@ function App() {
         <section className="flow-board" aria-label="visual data flow">
           {shouldShowInputForm ? (
             <form className="rag-form" onSubmit={handleSubmit}>
-              <label className="file-picker">
-                <span>PDF</span>
-                <input
-                  type="file"
-                  accept="application/pdf,.pdf,.txt,.md"
-                  multiple
-                  onChange={(event) => setSelectedFiles(Array.from(event.target.files ?? []))}
-                />
-                <strong>{formatSelectedFiles(selectedFiles)}</strong>
-              </label>
+              <div className="file-picker demo-document">
+                <span>Demo PDF</span>
+                <strong>{isPreloading ? `${DEMO_DOCUMENT_LABEL} 준비 중` : `${DEMO_DOCUMENT_LABEL} · 청킹 완료`}</strong>
+              </div>
               <label className="prompt-box">
                 <span>Prompt</span>
                 <textarea
@@ -241,7 +269,7 @@ function App() {
                   placeholder="PDF에 대해 묻고 싶은 내용을 입력하세요"
                 />
               </label>
-              <button type="submit" disabled={isSubmitting || !query.trim()}>
+              <button type="submit" disabled={isPreloading || isSubmitting || !query.trim()}>
                 {isSubmitting ? 'Running' : 'Run RAG'}
               </button>
             </form>
@@ -249,7 +277,7 @@ function App() {
             <section className="run-summary">
               <div>
                 <span>Current Run</span>
-                <strong>{formatSelectedFiles(selectedFiles, '샘플 문서')} · “{query}”</strong>
+                <strong>{DEMO_DOCUMENT_LABEL} · “{query}”</strong>
               </div>
               <button type="button" onClick={() => setIsInputOpen(true)}>
                 Edit input
@@ -398,24 +426,6 @@ function submitPrompt(query) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, top_k: 3 }),
   })
-}
-
-function submitUploadedPdf(files, query) {
-  const formData = new FormData()
-  files.forEach((file) => formData.append('files', file))
-  formData.append('query', query)
-  formData.append('top_k', '3')
-
-  return fetchWithTimeout(`${API_BASE_URL}/api/rag/upload-query`, {
-    method: 'POST',
-    body: formData,
-  })
-}
-
-function formatSelectedFiles(files, emptyLabel = '파일 선택') {
-  if (!files.length) return emptyLabel
-  if (files.length === 1) return files[0].name
-  return `${files[0].name} 외 ${files.length - 1}개`
 }
 
 async function fetchWithTimeout(url, options) {

@@ -1,6 +1,8 @@
 import os
 from typing import Any
 
+import numpy as np
+
 from schemas import PipelineStage, QueryResponse
 
 
@@ -52,11 +54,13 @@ def build_pipeline_stages(
     prompt_preview: dict[str, Any],
 ) -> list[PipelineStage]:
     vector_items = vector_store["items"]
+    points = pca_3d_points(vector_items)
+    points_by_id = {item["id"]: points[index] for index, item in enumerate(vector_items)}
     return [
         build_chunk_stage(documents, chunks),
-        build_embedding_stage(chunks, vector_items, use_gemini),
+        build_embedding_stage(chunks, vector_items, use_gemini, points),
         build_vector_store_stage(vector_items, vector_store),
-        build_retrieval_stage(query, top_k, retrieval_candidates, matches),
+        build_retrieval_stage(query, top_k, retrieval_candidates, matches, points_by_id),
         build_context_stage(matches, prompt_preview),
         build_generation_stage(answer, model_name, prompt_preview),
     ]
@@ -87,6 +91,7 @@ def build_embedding_stage(
     chunks: list[dict[str, Any]],
     vector_items: list[dict[str, Any]],
     use_gemini: bool,
+    points: list[dict[str, float]],
 ) -> PipelineStage:
     embedding_model = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001") if use_gemini else "local-demo"
     return PipelineStage(
@@ -94,11 +99,48 @@ def build_embedding_stage(
         title="임베딩",
         input=[chunk["id"] for chunk in chunks],
         output=[
-            {"id": item["id"], "embedding_preview": item["embedding"][:4]}
-            for item in vector_items
+            {
+                "id": item["id"],
+                "embedding_preview": item["embedding"][:4],
+                "point3d": points[index],
+            }
+            for index, item in enumerate(vector_items)
         ],
         metric=embedding_model,
     )
+
+
+def pca_3d_points(vector_items: list[dict[str, Any]]) -> list[dict[str, float]]:
+    if not vector_items:
+        return []
+
+    vectors = np.array([item.get("full_embedding") or item["embedding"] for item in vector_items], dtype=float)
+    if vectors.ndim != 2 or vectors.shape[0] < 2:
+        return [{"x": 0.0, "y": 0.0, "z": 0.0} for _ in vector_items]
+
+    centered = vectors - vectors.mean(axis=0, keepdims=True)
+    _, singular_values, components_t = np.linalg.svd(centered, full_matrices=False)
+    dimensions = min(3, components_t.shape[0])
+    projected = centered @ components_t[:dimensions].T
+
+    if dimensions < 3:
+        projected = np.pad(projected, ((0, 0), (0, 3 - dimensions)))
+
+    scales = np.percentile(np.abs(projected), 95, axis=0)
+    fallback_scales = np.max(np.abs(projected), axis=0)
+    scales = np.where(np.isfinite(scales) & (scales > 0), scales, fallback_scales)
+    scales = np.where(scales > 0, scales, 1.0)
+    normalized = np.clip((projected / scales) * 28, -36, 36)
+
+    return [
+        {
+            "x": round(float(point[0]), 4),
+            "y": round(float(point[1]), 4),
+            "z": round(float(point[2]), 4),
+            "weight": round(float(singular_values[0] if len(singular_values) else 0), 4),
+        }
+        for point in normalized
+    ]
 
 
 def build_vector_store_stage(
@@ -119,17 +161,20 @@ def build_retrieval_stage(
     top_k: int,
     retrieval_candidates: list[dict[str, Any]],
     matches: list[dict[str, Any]],
+    points_by_id: dict[str, dict[str, float]],
 ) -> PipelineStage:
+    query_point = weighted_query_point(matches, points_by_id)
     return PipelineStage(
         id="retrieve",
         title="검색",
-        input={"query": query, "top_k": top_k},
+        input={"query": query, "top_k": top_k, "query_point3d": query_point},
         output={
             "candidates": [
                 {
                     "chunk_id": candidate["id"],
                     "score": candidate["score"],
                     "text": candidate["text"],
+                    "point3d": points_by_id.get(candidate["id"]),
                 }
                 for candidate in retrieval_candidates
             ],
@@ -138,12 +183,32 @@ def build_retrieval_stage(
                     "chunk_id": match["id"],
                     "score": match["score"],
                     "text": match["text"],
+                    "point3d": points_by_id.get(match["id"]),
                 }
                 for match in matches
             ],
+            "query_point3d": query_point,
         },
         metric=f"top-{top_k}",
     )
+
+
+def weighted_query_point(matches: list[dict[str, Any]], points_by_id: dict[str, dict[str, float]]) -> dict[str, float]:
+    weighted_points = []
+    for match in matches:
+        point = points_by_id.get(match["id"])
+        if not point:
+            continue
+        weighted_points.append((max(float(match.get("score") or 0), 0.01), point))
+
+    if not weighted_points:
+        return {"x": 0.0, "y": 0.0, "z": 0.0}
+
+    total = sum(weight for weight, _ in weighted_points)
+    return {
+        axis: round(sum(weight * point[axis] for weight, point in weighted_points) / total, 4)
+        for axis in ("x", "y", "z")
+    }
 
 
 def build_context_stage(

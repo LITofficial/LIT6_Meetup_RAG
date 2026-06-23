@@ -10,9 +10,10 @@ from schemas import QueryRequest, QueryResponse
 
 PipelineRunner = Callable[..., Awaitable[QueryResponse]]
 UploadReader = Callable[[UploadFile], Awaitable[dict[str, Any]]]
+DemoPreloader = Callable[[], Awaitable[dict[str, Any]]]
 
 
-def create_app(run_pipeline: PipelineRunner, document_from_upload: UploadReader) -> FastAPI:
+def create_app(run_pipeline: PipelineRunner, document_from_upload: UploadReader, preload_demo_document: DemoPreloader | None = None) -> FastAPI:
     app = FastAPI(title="RAG Pipeline Visualizer API", version="0.1.0")
 
     app.add_middleware(
@@ -63,6 +64,12 @@ def create_app(run_pipeline: PipelineRunner, document_from_upload: UploadReader)
     @app.get("/api/rag/demo", response_model=QueryResponse)
     async def get_demo_pipeline() -> QueryResponse:
         return await run_pipeline(query="신규 고객 환불 정책을 근거와 함께 알려줘")
+
+    @app.get("/api/rag/preload")
+    async def preload_rag_demo() -> dict[str, Any]:
+        if preload_demo_document is None:
+            raise HTTPException(status_code=404, detail="데모 문서 사전 처리 함수가 설정되지 않았습니다.")
+        return await preload_demo_document()
 
     @app.post("/api/rag/query", response_model=QueryResponse)
     async def query_rag(request: QueryRequest) -> QueryResponse:
