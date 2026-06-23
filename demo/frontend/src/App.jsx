@@ -146,8 +146,8 @@ function App() {
 
         const preloadedStages = normalizeStages(data.stages ?? [])
         if (preloadedStages.length > 0) {
-          setStages([preloadedStages[0], ...defaultStages.slice(1)])
-          setActiveStage(0)
+          setStages([...preloadedStages, ...defaultStages.slice(preloadedStages.length)])
+          setActiveStage(Math.min(preloadedStages.length - 1, 2))
         }
       } catch (preloadError) {
         if (!ignore) setError(preloadError.message)
@@ -203,11 +203,12 @@ function App() {
       }
 
       const data = await response.json()
-      setStages(normalizeStages(data.stages))
+      const nextStages = normalizeStages(data.stages)
+      setStages(nextStages)
       setAnswer(data.answer)
       setSources(data.sources ?? [])
       setModelName(data.model ?? '')
-      setActiveStage(data.stages?.length > 1 ? 1 : 0)
+      setActiveStage(Math.max(0, nextStages.findIndex((item) => item.id === 'retrieve')))
       setHasRun(true)
       setIsInputOpen(false)
     } catch (requestError) {
@@ -258,7 +259,7 @@ function App() {
             <form className="rag-form" onSubmit={handleSubmit}>
               <div className="file-picker demo-document">
                 <span>Demo PDF</span>
-                <strong>{isPreloading ? `${DEMO_DOCUMENT_LABEL} 준비 중` : `${DEMO_DOCUMENT_LABEL} · 청킹 완료`}</strong>
+                <strong>{isPreloading ? `${DEMO_DOCUMENT_LABEL} 준비 중` : `${DEMO_DOCUMENT_LABEL} · 임베딩/저장 완료`}</strong>
               </div>
               <label className="prompt-box">
                 <span>Prompt</span>

@@ -12,7 +12,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import rag_helpers as helpers
 from rag_config import ANSWER_CACHE, RAG_PROMPT, VECTOR_STORE_CACHE, logger
-from response_builders import build_chunk_stage, build_query_response
+from response_builders import build_chunk_stage, build_embedding_stage, build_query_response, build_vector_store_stage, pca_3d_points
 from schemas import QueryResponse
 from server import create_app
 
@@ -48,7 +48,19 @@ async def run_pipeline(query: str, top_k: int = 3, documents: list[dict[str, str
 async def preload_demo_document() -> dict[str, Any]:
     documents = load_demo_documents()
     chunks = load_demo_chunks(documents)
-    return {"stages": [build_chunk_stage(documents, chunks)]}
+    use_gemini = resolve_gemini_mode(None)
+    embedding_model = prepare_embedding_model(use_gemini)
+    chunk_embeddings = await embed_chunks(documents, chunks, embedding_model, use_gemini)
+    vector_store = store_vectors(documents, chunks, chunk_embeddings, embedding_model, use_gemini)
+    vector_items = vector_store["items"]
+    points = pca_3d_points(vector_items)
+    return {
+        "stages": [
+            build_chunk_stage(documents, chunks),
+            build_embedding_stage(chunks, vector_items, use_gemini, points),
+            build_vector_store_stage(vector_items, vector_store),
+        ]
+    }
 
 
 def resolve_gemini_mode(use_gemini: bool | None) -> bool:
